@@ -1,0 +1,15 @@
+# 运行痕迹 / 临时目录（不纳入版本控制）
+.traces/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
