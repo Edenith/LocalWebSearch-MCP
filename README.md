@@ -1,49 +1,51 @@
-# Local Web Search MCP Server ｜ 本地 Web 搜索 MCP 服务器
+# Local Web Search MCP Server
 
-> 给国内 Claude Code 的零依赖本地搜索 MCP —— 一个纯 Python 标准库实现的本地 MCP 搜索服务器，让 Claude Code（或其他 MCP 客户端）拥有真实的联网搜索能力。与模型后端无关，用**本机网络**搜索网页：**Bing 直连优先，境外引擎走 SOCKS5 代理兜底**。
+> A zero-dependency, local MCP search server for Claude Code — implemented in pure Python standard library. Gives Claude Code (or any MCP client) real web-search capability using your **local network**, independent of your model backend. **Bing直连-first**, with SOCKS5 proxy fallback for overseas engines.
 
-## 为什么要做这个
+🌐 **Languages:** [English](README.md) | [简体中文](README.zh-CN.md)
 
-Claude Code 的**内置 WebSearch / WebFetch 工具依赖 Anthropic 官方 API**。如果你的 Claude Code 后端是第三方模型（DeepSeek、Qwen 等，经 CC Switch 等本地代理接入），内置搜索工具会失效。
+## Why this exists
 
-这套方案用一个 **MCP over stdio** 的本地 Python 进程，把「本机真实网络」变成模型可调用的搜索工具：
+Claude Code's **built-in WebSearch / WebFetch tools rely on the Anthropic official API**. If your Claude Code backend is a third-party model (DeepSeek, Qwen, etc., connected via a local proxy like CC Switch), the built-in search tools stop working.
+
+This project turns your **local, real network** into a model-callable search tool via a **MCP-over-stdio** Python process:
 
 ```
-Claude Code ──MCP stdio──▶ local_search_server.py（本机 Python 进程）
+Claude Code ──MCP stdio──▶ local_search_server.py (local Python process)
                                   │
-                                  ├─ Bing 直连（国内可达，主引擎）
-                                  ├─ DuckDuckGo 走 SOCKS5 代理（兜底）
-                                  └─ Google 走 SOCKS5 代理（候选）
+                                  ├─ Bing direct (China-reachable, primary)
+                                  ├─ DuckDuckGo via SOCKS5 proxy (fallback)
+                                  └─ Google via SOCKS5 proxy (candidate)
 ```
 
-## 特性
+## Features
 
-- **纯 Python 标准库**（json + urllib + threading + html.parser），零依赖、启动快（~50ms）
-- 完整实现 MCP over stdio 协议（JSON-RPC 2.0）：`initialize` / `tools/list` / `tools/call`
-- 提供两个工具：
-  - `web_search(query, num_results=8, use_proxy=True)` → 搜索网页
-  - `web_fetch(url, timeout_s=20, use_proxy=True)` → 抓取网页正文
-- **Bing 直连优先**（国内可达、稳定、无需代理），失败自动切 DuckDuckGo（走代理）
-- 可配置 SOCKS5 代理端口（默认 `127.0.0.1:1080`，兼容 v2rayN）
+- **Pure Python standard library** (json + urllib + threading + html.parser) — zero dependencies, fast startup (~50ms)
+- Full **MCP over stdio** protocol (JSON-RPC 2.0): `initialize` / `tools/list` / `tools/call`
+- Two tools:
+  - `web_search(query, num_results=8, use_proxy=True)` → search the web
+  - `web_fetch(url, timeout_s=20, use_proxy=True)` → fetch readable page text
+- **Bing direct-first** (stable, no proxy needed in CN), auto-falls back to DuckDuckGo (via proxy)
+- Configurable SOCKS5 proxy port (default `127.0.0.1:1080`, v2rayN-compatible)
 
-## 安装
+## Install
 
-### 1. 前置要求
+### 1. Requirements
 
-- Python 3.8+（标准库即可，无需 pip 安装任何包）
-- （可选）v2rayN 或其他 SOCKS5 代理，端口默认 `1080` —— 用于访问 Google / DuckDuckGo
+- Python 3.8+ (standard library only, no pip packages needed)
+- *(Optional)* v2rayN or any SOCKS5 proxy, port `1080` — only for Google / DuckDuckGo. Works without it too (Bing only).
 
-### 2. 放置文件
+### 2. Place the file
 
-把 `local_search_server.py` 放到任意位置，例如：
+Put `local_search_server.py` anywhere, e.g.:
 
 ```
-C:\Users\你的用户名\.claude\mcp-servers\local_search_server.py
+C:\Users\<your-username>\.claude\mcp-servers\local_search_server.py
 ```
 
-### 3. 注册到 Claude Code
+### 3. Register in Claude Code
 
-编辑 `~/.claude.json`（Windows 路径 `C:\Users\你的用户名\.claude.json`），在 `mcpServers` 节点添加：
+Edit `~/.claude.json` (Windows: `C:\Users\<your-username>\.claude.json`), add under `mcpServers`:
 
 ```json
 {
@@ -51,71 +53,67 @@ C:\Users\你的用户名\.claude\mcp-servers\local_search_server.py
     "web-search": {
       "type": "stdio",
       "command": "python",
-      "args": ["C:/Users/你的用户名/.claude/mcp-servers/local_search_server.py"],
+      "args": ["C:/Users/<your-username>/.claude/mcp-servers/local_search_server.py"],
       "env": {}
     }
   }
 }
 ```
 
-### 4. 验证连接
+### 4. Verify connection
 
 ```bash
 claude mcp list
 ```
 
-看到：
+You should see:
 
 ```
 web-search: python .../local_search_server.py - ✔ Connected
 ```
 
-即连接成功。
+### 5. Use it in Claude Code
 
-### 5. 在 Claude Code 中使用
-
-按你希望的方式，让 Claude 调用这两个 MCP 工具（搜网页 / 抓网页）：
+Ask Claude to call these two tools:
 
 ```
 mcp__web-search__web_search(query="...", num_results=8, use_proxy=true)
 mcp__web-search__web_fetch(url="https://...", use_proxy=true)
 ```
 
-> 提示：也可以在你的全局 CLAUDE.md 里写一条规则，提醒自己「搜索用 MCP 工具、不用内置 WebSearch」，这样每次会话都自动遵守。
+> Tip: add a rule to your global `CLAUDE.md` reminding yourself to use these MCP tools instead of the built-in WebSearch.
 
-## 参数说明
+## Parameters
 
 ### web_search
 
-| 参数 | 类型 | 默认 | 说明 |
+| Param | Type | Default | Description |
 |---|---|---|---|
-| `query` | string | 必填 | 搜索关键词 |
-| `num_results` | int | 8 | 返回条数（1~15） |
-| `use_proxy` | bool | true | 是否走 SOCKS5 代理访问 Google/DDG（Bing 总是尝试直连） |
+| `query` | string | required | Search keywords |
+| `num_results` | int | 8 | Results to return (1–15) |
+| `use_proxy` | bool | true | Use SOCKS5 proxy for Google/DDG (Bing is always direct) |
 
-返回：`[{title, url, snippet, engine}]`
+Returns: `[{title, url, snippet, engine}]`
 
 ### web_fetch
 
-| 参数 | 类型 | 默认 | 说明 |
+| Param | Type | Default | Description |
 |---|---|---|---|
-| `url` | string | 必填 | 要抓取的网址 |
-| `timeout_s` | number | 20 | 超时（秒） |
-| `use_proxy` | bool | true | 是否走代理（境外站点建议 true，国内站点可 false） |
+| `url` | string | required | URL to fetch |
+| `timeout_s` | number | 20 | Timeout (seconds) |
+| `use_proxy` | bool | true | Use proxy (true for overseas sites, false for CN sites) |
 
-返回：`# 标题` + URL + 正文前 6000 字符
+Returns: `# Title` + URL + first 6000 chars of page text
 
-## 网络策略
+## Network strategy
 
-| 引擎 | 方式 | 场景 |
+| Engine | Method | Scenario |
 |---|---|---|
-| Bing | 直连 | 国内主引擎，无需代理 |
-| DuckDuckGo | SOCKS5 代理 | Bing 失败时兜底 |
-| Google | SOCKS5 代理 | 候选引擎 |
+| Bing | direct | Primary engine in CN, no proxy needed |
+| DuckDuckGo | SOCKS5 proxy | Fallback if Bing fails |
+| Google | SOCKS5 proxy | Candidate engine |
 
-代理地址默认 `socks5://127.0.0.1:1080`，可通过环境变量 `LOCAL_SEARCH_SOCKS_PORT` 修改端口。
-
-## 配置代理端口
+Default proxy `socks5://127.0.0.1:1080`. Change the port via env var `LOCAL_SEARCH_SOCKS_PORT`:
 
 ```bash
 # Windows
@@ -125,35 +123,35 @@ set LOCAL_SEARCH_SOCKS_PORT=1080
 export LOCAL_SEARCH_SOCKS_PORT=1080
 ```
 
-## 工作原理（核心代码）
+## How it works
 
-### MCP stdio 协议
+### MCP stdio protocol
 
-MCP（Model Context Protocol）客户端通过 stdin 发 JSON-RPC 2.0 消息，服务器通过 stdout 回响应，用换行分隔：
+The MCP client sends JSON-RPC 2.0 messages on stdin; the server replies on stdout, newline-delimited:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}
 {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"serverInfo":{"name":"web-search"}}}
 ```
 
-### 搜索流程
+### Search flow
 
 ```python
 def web_search(query, num_results, use_proxy):
-    # 1) Bing 直连（主引擎）
+    # 1) Bing direct (primary engine)
     html = _http_get(f"https://www.bing.com/search?q={q}", False, 15)
-    results = _parse_bing(html, num)   # 正则提取 b_algo 结果块
+    results = _parse_bing(html, num)   # regex-extract b_algo blocks
     if results:
         return results
-    # 2) DuckDuckGo 走代理（兜底）
+    # 2) DuckDuckGo via proxy (fallback)
     html = _http_get(f"https://html.duckduckgo.com/html/?q={q}", True, 15)
     results = _parse_ddg(html, num)
     return results
 ```
 
-### 代理切换
+### Proxy switching
 
-`use_proxy=True` 时优先尝试 PySocks，没装则直连兜底：
+On `use_proxy=True`, tries PySocks first, falls back to direct:
 
 ```python
 try:
@@ -161,23 +159,25 @@ try:
     socks.set_default_proxy(socks.SOCKS5, host, port)
     socket.socket = socks.socksocket
 except ImportError:
-    pass  # 无 PySocks 则直连
+    pass  # no PySocks → direct connection
 ```
 
-### HTML 正文提取
+### HTML text extraction
 
-用标准库 `html.parser.HTMLParser` 实现轻量正文提取器，跳过 `script/style/noscript/svg`，在段落标签处加换行：
+A lightweight extractor built on stdlib `html.parser.HTMLParser`, skipping `script/style/noscript/svg` and adding newlines at block tags:
 
 ```python
 class _TextExtractor(HTMLParser):
     skip_tags = {"script", "style", "noscript", "svg", "template"}
-    # ... 见源码
+    # ... see source
 ```
 
-## 许可
+## FAQ
 
-MIT License — 自由使用、修改、分享。
+- **No search results?** Check your network / Bing reachability. For overseas engines, start v2rayN.
+- **"PySocks missing"?** No problem — Bing direct still works, only overseas engines degrade.
+- **File `USAGE.md` removed?** English instructions live in this README; Chinese in `README.zh-CN.md`.
 
----
+## License
 
-*Made with ♥ for the Claude Code community*
+MIT License — free to use, modify, and share.
