@@ -227,8 +227,33 @@ def web_fetch(url, timeout_s, use_proxy):
 # MCP stdio 协议（JSON-RPC 2.0）
 # ----------------------------------------------------------------------------
 def _send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
+    obj = _strip_surrogates(obj)  # 协议层输出同样清理，防止毒 OOM 整个服务器
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except (UnicodeEncodeError, ValueError):
+        sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")  # 兜底：\uXXXX 转义
     sys.stdout.flush()
+
+
+def _strip_surrogates(o):
+    """递归清洗：丢弃 UTF-16 孤立代理字符（U+D800–U+DFFF），防止 json.dumps 编码报错。
+
+    搜到的网页内容偶发含损坏的半个 emoji/代理片段，直接序列化会抛
+    'utf-8' codec can't encode ... surrogates not allowed，故在输出前统一清理。
+    """
+    def _clean_str(s):
+        try:
+            # 先按 ascii 编一次能发现孤立代理？不可靠；直接逐字符过滤最稳
+            return "".join(c for c in s if not 0xD800 <= ord(c) <= 0xDFFF)
+        except Exception:
+            return s
+    if isinstance(o, str):
+        return _clean_str(o)
+    if isinstance(o, list):
+        return [_strip_surrogates(x) for x in o]
+    if isinstance(o, dict):
+        return {k: _strip_surrogates(v) for k, v in o.items()}
+    return o
 
 
 def _call_tool(name, args):
@@ -278,7 +303,12 @@ def main():
             args = params.get("arguments", {})
             try:
                 result = _call_tool(name, args)
-                content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (list, dict)) else str(result)}]
+                result = _strip_surrogates(result)
+                try:
+                    text = json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (list, dict)) else str(result)
+                except (UnicodeEncodeError, ValueError):
+                    text = json.dumps(result, ensure_ascii=True, indent=2)  # 终极兜底：全转 \uXXXX
+                content = [{"type": "text", "text": text}]
                 _send({"jsonrpc": "2.0", "id": mid, "result": {"content": content, "isError": False}})
             except Exception as e:
                 _send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"[error] {e}"}], "isError": True}})
