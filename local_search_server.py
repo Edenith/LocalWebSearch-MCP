@@ -24,17 +24,14 @@ import http.client
 import json
 import os
 import re
+import socket
+import struct
 import sys
 import urllib.parse
 import urllib.request
 import zlib
 from html import unescape
 from html.parser import HTMLParser
-
-try:
-    import socks  # PySocks：可选依赖，装了才能走 SOCKS5 代理
-except ImportError:
-    socks = None
 
 # ----------------------------------------------------------------------------
 # 配置
@@ -47,13 +44,30 @@ UA = (
 )
 
 SERVER_NAME = "web-search"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.2.1"
 
-# 判定"结果是否和查询对得上"的阈值：命中关键词最全的那条结果，
-# 覆盖的关键词比例低于这个数，就认为引擎给的是无关填充结果。
-# 取这么低是因为中英混排的查询（"Python 异步编程 教程"）返回英文结果时，
-# 命中率天然就低；这里只求拦住"一个关键词都没命中"的纯垃圾。
-RELEVANCE_FLOOR = 0.15
+# 判断一个关键词里有没有中文字（用于决定是否套用"部分命中"放宽规则）
+_CJK_RE = re.compile(r"[一-鿿]")
+
+# 判定"结果是否和查询对得上"的阈值，配合 _relevance() 的"中位数覆盖"使用。
+# 0.20 是实测定的：拿 6 条正常查询和 4 条已知拿到垃圾结果的查询跑了一轮，
+# 正常的最低 0.25（"Python 异步编程 asyncio 教程"——中文查询返回英文结果，
+# 命中率天然低），垃圾的最高 0.17（"SolidWorks Wine CrossOver Linux 2026
+# compatibility"，Bing 只认了 SolidWorks 一个词）。窗口只有 0.17~0.25，
+# 所以配套做了"多次尝试取最优"，万一误判也只是多花一次请求，不会给出错结果。
+RELEVANCE_FLOOR = 0.20
+
+# 第二条判据（见 _is_junk）：查询实词够多、但其中绝大多数在所有结果里一次都没出现。
+# 这条用"整批结果的并集"算，不随 num_results 变化 —— 中位数会随条数的奇偶浮动，
+# 实测同一条 "SolidWorks Wine CrossOver Linux 2026 compatibility" 在 num=4/6 时
+# 得 0.17（判为垃圾）、num=5 时得 0.33（判为正常），只靠中位数会漏。
+MIN_TERMS_FOR_COVERAGE_RULE = 4   # 实词少于这个数就不套用本规则，避免误伤短查询
+MAX_MISSED_TERMS = 3              # 未命中的实词达到这个数（且实词总数够多）就判为垃圾
+
+# 判定不达标时，附在每条结果上的提示
+WARNING_JUNK = "结果与查询关键词重合度低，可能不相关（引擎对这条查询只匹配了其中个别词，返回了填充结果）"
+# 代理不可用时退回直连，必须说清楚——否则"走了代理却搜不到境外内容"很难查
+WARNING_NO_PROXY = "代理不可用，本次为直连结果（境外内容可能缺失）"
 
 # 做相关性判断时忽略的虚词：英文虚词 + 中文疑问/连接词。
 # 中文疑问词尤其重要——Bing 返回垃圾时经常只命中"如何""什么"这类词。
@@ -71,7 +85,7 @@ _STOPWORDS = {
 TOOLS = [
     {
         "name": "web_search",
-        "description": "用本机网络搜索网页。Bing 直连优先，结果与查询对不上时换 DuckDuckGo（需 use_proxy）。默认对前 fetch_top 个结果自动抓取正文片段放进 content 字段，供 AI 先粗略浏览再决定抓哪个详情。返回 [{'title','url','snippet','content','engine'}]；若引擎返回的结果与查询关键词几乎不重合（Bing 偶发如此，尤其对部分中文查询），会在每条结果里附一个 warning 字段提示可能不相关。query=搜索词；num_results=返回条数(1-15)；use_proxy=True 走 v2rayN SOCKS5 代理；fetch_content=True 时自动抓正文；fetch_top=抓前几个(默认3)；content_chars=每个正文截取字符数(默认1500)。",
+        "description": "用本机网络搜索网页。Bing 直连优先，结果与查询对不上时换 DuckDuckGo（该兜底不受 use_proxy 限制）。默认对前 fetch_top 个结果自动抓取正文片段放进 content 字段，供 AI 先粗略浏览再决定抓哪个详情。返回 [{'title','url','snippet','content','engine'}]；结果里可能带 warning 字段，表示「相关性低，可能是填充结果」或「代理不可用，本次为直连结果」。query=搜索词；num_results=返回条数(1-15)；use_proxy=True 走 v2rayN SOCKS5 代理；fetch_content=True 时自动抓正文；fetch_top=抓前几个(默认3)；content_chars=每个正文截取字符数(默认1500)。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -170,6 +184,67 @@ def _decode_body(raw, content_type):
     return raw.decode("utf-8", "replace")
 
 
+def _recv_exact(sock, n):
+    """从 socket 精确读 n 个字节（SOCKS5 握手用）。"""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("SOCKS5 代理在握手过程中断开连接")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(proxy_host, proxy_port, dest_host, dest_port, timeout):
+    """手工完成一次 SOCKS5 握手并连到目标，返回已连接的 socket。
+
+    为什么要自己写：PySocks 是第三方依赖，而本项目的卖点就是"纯标准库、零依赖"。
+    更要命的是**缺了它原本只是静默退回直连**——如果你的 python 恰好没装 PySocks
+    （比如 PATH 里排在前面的某个软件自带 python），use_proxy=True 会一声不响地变成
+    直连，等到发现"怎么走了代理还是搜不到境外内容"时已经很难查了。自己实现之后
+    走不走代理只取决于参数，与跑在哪个解释器上无关。
+
+    协议（无认证）：
+      C→S  05 01 00                     版本5 / 1 种认证方式 / 无认证
+      S→C  05 00                        选定无认证
+      C→S  05 01 00 <ATYP> <ADDR> <PORT> CONNECT 请求
+      S→C  05 00 00 <ATYP> <ADDR> <PORT> 成功（第 2 字节非 0 即失败）
+    """
+    s = socket.create_connection((proxy_host, proxy_port), timeout)
+    try:
+        s.sendall(b"\x05\x01\x00")
+        if _recv_exact(s, 2) != b"\x05\x00":
+            raise OSError("SOCKS5 代理未接受无认证方式（要求认证或版本不符）")
+
+        # 目标是 IP 字面量就直接塞字节，否则按域名送（让代理那边去解析，
+        # 免得受本机 DNS 影响——被墙环境下本机 DNS 往往是不可靠的）
+        try:
+            addr = b"\x01" + socket.inet_aton(dest_host)
+        except OSError:
+            try:
+                addr = b"\x04" + socket.inet_pton(socket.AF_INET6, dest_host)
+            except OSError:
+                raw = dest_host.encode("idna")
+                addr = b"\x03" + bytes([len(raw)]) + raw
+
+        s.sendall(b"\x05\x01\x00" + addr + struct.pack("!H", dest_port))
+        head = _recv_exact(s, 4)
+        if head[1] != 0:
+            raise OSError(f"SOCKS5 代理拒绝连接（rep={head[1]}）")
+        atyp = head[3]
+        if atyp == 1:
+            _recv_exact(s, 4)
+        elif atyp == 4:
+            _recv_exact(s, 16)
+        elif atyp == 3:
+            _recv_exact(s, _recv_exact(s, 1)[0])
+        _recv_exact(s, 2)  # 绑定端口
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
 def _socks_conn_classes(proxy_host, proxy_port):
     """造出走 SOCKS5 的 HTTP/HTTPS 连接类。
 
@@ -186,12 +261,7 @@ def _socks_conn_classes(proxy_host, proxy_port):
             self._create_connection = self._socks_create_connection
 
         def _socks_create_connection(self, address, timeout=None, source_address=None):
-            s = socks.socksocket()
-            s.set_proxy(socks.SOCKS5, proxy_host, proxy_port)
-            if timeout is not None:
-                s.settimeout(timeout)
-            s.connect(address)
-            return s
+            return _socks5_connect(proxy_host, proxy_port, address[0], address[1], timeout)
 
     class _HTTP(_Mixin, http.client.HTTPConnection):
         pass
@@ -234,7 +304,7 @@ def _build_opener(use_proxy):
     同类型的默认 handler，而 HTTPHandler 和 HTTPSHandler 是兄弟关系而非父子，
     只传一个的话，另一个的默认实现会排在前面把请求截走（等于没走代理）。
     """
-    if use_proxy and socks is not None:
+    if use_proxy:
         http_cls, https_cls = _socks_conn_classes(PROXY_HOST, PROXY_PORT)
         return urllib.request.build_opener(
             _SocksHTTPHandler(http_cls), _SocksHTTPSHandler(https_cls))
@@ -368,32 +438,94 @@ def _attach_content(results, fetch_top, content_chars, use_proxy):
 
 
 def _query_keywords(query):
-    """从查询里抽出用来做相关性判断的关键词：英文单词 + 中文词块/bigram。"""
+    """抽出用于相关性判断的关键词：英文单词 + 中文词块。
+
+    中文只取完整词块，**不展开 bigram**。bigram 会往分母里塞进"步编"这类
+    永远匹配不上的碎片，把中文查询的得分稀释掉。实测（6 条正常查询 + 4 条
+    已知拿到垃圾结果的查询）：带 bigram 时正常查询最低 0.14、垃圾最高 0.17，
+    区间重叠，任何阈值都分不开；只取完整词块后是 0.25 vs 0.17，才分得开。
+    为不损失中文子串匹配能力，匹配时对较长的中文词块放宽（见 _term_hit）。
+    """
     kws = set()
     for w in re.findall(r"[A-Za-z0-9_]{2,}", query):
         w = w.lower()
         if w not in _STOPWORDS:
             kws.add(w)
     for run in re.findall(r"[一-鿿]{2,}", query):
-        cands = {run} | {run[i:i + 2] for i in range(len(run) - 1)}
-        kws.update(c for c in cands if c not in _STOPWORDS)
+        if run not in _STOPWORDS:
+            kws.add(run)
     return kws
 
 
-def _relevance(results, query):
-    """0.0~1.0：命中查询关键词最全的那条结果，覆盖了多少比例的关键词。
+def _term_hit(term, hay):
+    """判断单个关键词在文本里算不算命中。
 
-    Bing 对部分查询（尤其中文）会返回与查询毫不相干的随机填充结果，
-    且每次请求还都不一样——用这个指标把它们识别出来，好换引擎重试。
+    较长的中文词块允许"部分命中"：只要它的任一 bigram 出现在文本里就算 ——
+    这样查询里的"异步编程"遇上只写了"异步"或"编程"的页面也能计上。
+    分母仍按完整词块数算，所以不会被稀释。
+    """
+    if term in hay:
+        return True
+    if _CJK_RE.search(term) and len(term) >= 3:
+        return any(term[i:i + 2] in hay for i in range(len(term) - 1))
+    return False
+
+
+def _relevance(results, query):
+    """0.0~1.0：这批结果【中位数】命中查询关键词的比例。
+
+    为什么取中位数而不是"最好那一条"：引擎给垃圾结果时的典型形态是
+    "一条沾边 + 其余全不沾"。只看最好的那条，单独一条就能把整批垃圾掩盖过去
+    —— 实测 "SolidWorks Wine CrossOver Linux 2026 compatibility" 被 Bing
+    降级成官网首页 + B站教程，最好那条仍有 0.33，跟结果完全正确的
+    "python asyncio tutorial" 数值一模一样，任何阈值都分不开。
+    换成中位数后两者分别是 0.17 和 0.33，才分得开。
     """
     kws = _query_keywords(query)
     if not kws:
         return 1.0  # 抽不出关键词就无从判断，一律放行，避免误杀
-    best = 0.0
-    for r in results:
-        hay = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
-        best = max(best, sum(1 for k in kws if k in hay) / len(kws))
-    return best
+    if not results:
+        return 0.0
+    per = sorted(
+        (sum(1 for k in kws if _term_hit(k, f"{r.get('title', '')} {r.get('snippet', '')}".lower()))
+         / len(kws)
+         for r in results),
+        reverse=True,
+    )
+    return per[len(per) // 2]
+
+
+def _missed_terms(results, query):
+    """整批结果里一次都没出现过的查询实词个数，以及实词总数。
+
+    用"整批的并集"而不是"某一条"，所以结论不随 num_results 变化。
+    """
+    kws = _query_keywords(query)
+    if not kws:
+        return 0, 0
+    hays = [f"{r.get('title', '')} {r.get('snippet', '')}".lower() for r in results]
+    hit = sum(1 for k in kws if any(_term_hit(k, h) for h in hays))
+    return len(kws) - hit, len(kws)
+
+
+def _is_junk(results, query):
+    """这批结果是不是"引擎没认真对待查询"的产物。
+
+    两条判据取或，各自覆盖对方的盲区：
+
+    1. 中位数覆盖低于阈值 —— 抓"典型结果就是垃圾"的情况（"一条沾边 + 其余全不沾"）。
+       但它随 num_results 的奇偶浮动，单用会漏（见 RELEVANCE_FLOOR 处的实测）。
+    2. 查询实词够多、却几乎一个都没在结果里出现过 —— 抓"引擎只认其中一个词、
+       把其余限定词全丢掉"的情况。这条不受条数影响。
+
+    实测样本（6 条正常 + 4 条已知垃圾）两条合用全部判对。
+    """
+    if not results:
+        return True
+    if _relevance(results, query) < RELEVANCE_FLOOR:
+        return True
+    missed, total = _missed_terms(results, query)
+    return total >= MIN_TERMS_FOR_COVERAGE_RULE and missed >= MAX_MISSED_TERMS
 
 
 def _bing(q, num, use_proxy):
@@ -401,50 +533,70 @@ def _bing(q, num, use_proxy):
     return _parse_bing(html, num)
 
 
-def _ddg(q, num):
-    html = _http_get(f"https://html.duckduckgo.com/html/?q={q}", True, 20)
+def _ddg(q, num, timeout=8):
+    # 超时给得比主引擎短：这是"尽力而为"的兜底，代理不通时（端口在听但出口
+    # 挂了是最常见的坏法）不该让用户为了一个大概率要失败的第二引擎多等 20 秒。
+    html = _http_get(f"https://html.duckduckgo.com/html/?q={q}", True, timeout)
     return _parse_ddg(html, num)
 
 
 def web_search(query, num_results, use_proxy, fetch_content=True, fetch_top=3, content_chars=1500):
     num = max(1, min(int(num_results), 15))
     q = urllib.parse.quote(query)
-    fallback = []  # 全都不合格时退回这份"最不差"的，总比空手强
+    attempts = []  # [(中位数覆盖得分, 结果, 是否走了代理), ...]
 
-    def _finish(results, via_proxy):
-        if fetch_content:
-            return _attach_content(results, fetch_top, content_chars, via_proxy)
-        return results
+    def _collect(results, via_proxy):
+        if results:
+            attempts.append((_relevance(results, query), results, via_proxy))
 
-    # 1) Bing。use_proxy=True 走代理=国际视角；False 直连=国内版。
-    #    它对部分查询会返回无关的随机填充结果，所以不合格就重试一次。
+    def _have_usable():
+        """已经有任意一次尝试拿到了不像垃圾的结果。"""
+        return any(not _is_junk(a[1], query) for a in attempts)
+
+    # 1) Bing。use_proxy 决定走直连（国内视角）还是代理（外网视角）。
+    #    Bing 对部分查询只认其中一个词、把其余限定词全丢掉，所以不合格就重试一次。
     for _ in range(2):
         try:
-            results = _bing(q, num, use_proxy)
+            _collect(_bing(q, num, use_proxy), use_proxy)
         except Exception:
-            results = []
-        if results and not fallback:
-            fallback = results
-        if results and _relevance(results, query) >= RELEVANCE_FLOOR:
-            return _finish(results, use_proxy)
+            pass
+        if _have_usable():
+            break
 
-    # 2) 换 DuckDuckGo 兜底（它的 html 端点必须走代理，国内直连不通）
-    if use_proxy:
+    # 2) 只要 Bing 没给出合格结果，就再试 DuckDuckGo —— 不论 use_proxy 传的是什么。
+    #    兜底的意义是"换个引擎看看"，不该被主引擎的线路选择挡住；DDG 的 html
+    #    端点本身必须走代理，代理不通就当失败跳过（快速失败，不拖慢主流程）。
+    if not _have_usable():
         try:
-            results = _ddg(q, num)
-            if results and not fallback:
-                fallback = results
-            if results and _relevance(results, query) >= RELEVANCE_FLOOR:
-                return _finish(results, True)
+            _collect(_ddg(q, num), True)
         except Exception:
             pass
 
-    # 3) 都不合格：仍然给出兜底结果，并附上警告，免得把无关内容当真结果用
-    if not fallback:
+    if not attempts and use_proxy:
+        # 要代理却一次都没成功（代理没开、或端口在听但出口挂了）。
+        # 仍直连试一次，好过甩回一个毫无解释的空结果；同时打上警告说明。
+        try:
+            _collect(_bing(q, num, False), False)
+        except Exception:
+            pass
+        for r in (attempts[-1][1] if attempts else []):
+            r["warning"] = WARNING_NO_PROXY
+
+    if not attempts:
         return []
-    for r in fallback:
-        r["warning"] = "结果与查询关键词重合度低，可能不相关（引擎返回了填充结果）"
-    return _finish(fallback, use_proxy)
+    # 先挑出"不像垃圾"的那一批；都是垃圾就退回得分最高的，并打上警告
+    usable = [a for a in attempts if not _is_junk(a[1], query)]
+    if usable:
+        best, via_proxy = max(usable, key=lambda a: a[0])[1:]
+        best = list(best)
+    else:
+        _, best, via_proxy = max(attempts, key=lambda a: a[0])
+        best = list(best)
+        for r in best:
+            r["warning"] = WARNING_JUNK
+    if fetch_content:
+        return _attach_content(best, fetch_top, content_chars, via_proxy)
+    return best
 
 
 def web_fetch(url, timeout_s, use_proxy):
