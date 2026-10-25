@@ -13,3 +13,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 搜索服务器运行日志
+web-search.log
+web-search.log.1

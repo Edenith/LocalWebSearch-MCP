@@ -26,7 +26,8 @@ Claude Code ──MCP stdio──▶ local_search_server.py (local Python proces
   - `web_fetch(url, timeout_s=20, use_proxy=True)` → fetch readable page text
 - **Auto content fetch**: after a search, the top N result pages are fetched in parallel and their text is attached to each result as `content` — so the AI can skim real content before deciding which page to read in full
 - **Dual search modes**: `use_proxy=False` → Bing direct (China-reachable, domestic view); `use_proxy=True` → Bing via SOCKS5 proxy (overseas view) with DuckDuckGo backup — for searching foreign content / accessing sites blocked in CN
-- **Junk-result detection**: search engines sometimes answer a query by matching only *one* of its words and dropping the rest — e.g. `SolidWorks Wine CrossOver Linux 2026 compatibility` comes back as `solidworks.com` marketing pages, and `Hunt Showdown 1896 Easy Anti-Cheat Linux Proton support` comes back as dictionary definitions of "hunt". The server scores each result set against the query keywords (median coverage + how many query terms are missing entirely), retries Bing once, and switches to DuckDuckGo if nothing matches. If no engine produces anything relevant, the results carry a `warning` field rather than being passed off as answers
+- **Three-level result grading, and it fails closed**: search engines that suspect automation don't always show a captcha — they answer `HTTP 200` with a normal-looking page full of *unrelated* results. Measured on this setup: `"ED047TC2"` came back as BOSS直聘 job listings, `asdfqwer1234zzz` as Poki browser games, and a long-tail `RK3566 EBC_SDDO0 GPIO4 pin mux datasheet` matched only the first word. Every result set is graded **good** (most keywords matched), **partial** (the subject matched but qualifiers didn't — returned, but flagged) or **junk** (nothing in the query appears in any result). Junk is **never returned**: the tool raises an error instead, because callers that don't read `warning` fields will happily treat filler as evidence
+- **Three engines, throttled and cooled down**: Bing → Sogou → DuckDuckGo. An engine that answers with an anti-bot page (`202`/`403`/`429`, `anomaly`, `captcha`, `安全验证`, `antispider`, …) is put into a 10-minute cooldown instead of being hammered. Requests per engine are spaced out, and results are cached for 6 hours
 - **True zero dependencies** — including for the proxy. SOCKS5 is implemented against the stdlib socket API (~35 lines), so `use_proxy` never depends on a third-party package being installed in whichever interpreter happens to run the server
 - **UTF-8 correct on Windows**: MCP stdio is UTF-8, but on a Chinese Windows Python's stdio defaults to cp936/GBK — which garbles every Chinese query and turns every Chinese result into mojibake. The server talks to `sys.stdin.buffer` / `sys.stdout.buffer` directly, bypassing the locale encoding entirely
 - **Charset-aware decoding**: response bytes are decoded by sniffing UTF-8 → HTTP/meta `charset` → gb18030, so GBK/GB2312 Chinese pages don't come back as `�`. `gzip`/`deflate` responses are decompressed transparently
@@ -105,9 +106,9 @@ mcp__web-search__web_fetch(url="https://...", use_proxy=true)
 | `fetch_top` | int | 3 | How many of the top results to fetch content for |
 | `content_chars` | int | 1500 | Max chars of page text to keep per result |
 
-Returns: `[{title, url, snippet, content, engine}]`
+Returns: `[{title, url, snippet, content, engine, relevance}]`
 
-`engine` is `bing` or `duckduckgo`. A `warning` field appears on the results in two cases: every engine's results matched too few of the query's keywords (`结果与查询关键词重合度低…`), or the proxy was requested but unreachable so the results are direct-connection only (`代理不可用…`).
+`engine` is `bing`, `sogou` or `duckduckgo`. `relevance` is `good` or `partial`; `partial` results also carry a `warning` saying the query's qualifiers weren't covered. When every engine returns junk, the call **fails with an error** (message includes per-engine status) rather than returning filler — fall back to `web_fetch` on a known page, or retry later. A `warning` also appears when the proxy was requested but unreachable and the results are direct-only.
 
 ### web_fetch
 
@@ -121,19 +122,33 @@ Returns: `# Title` + URL + first 6000 chars of page text
 
 ## Network strategy
 
-| Mode | Engine | Method | Scenario |
+| Order | Engine | Method | Scenario |
 |---|---|---|---|
-| `use_proxy=False` | Bing | direct | Domestic CN search, no proxy needed |
-| `use_proxy=True` | Bing | SOCKS5 proxy | Overseas search — foreign content, sites blocked in CN |
-| `use_proxy=True` | DuckDuckGo (html endpoint) | SOCKS5 proxy | Backup, used when Bing's results don't match the query |
+| 1 | Bing | direct (`use_proxy=False`) or SOCKS5 (`use_proxy=True`) | Primary engine |
+| 2 | Sogou | direct | CN-reachable backup; no proxy needed. Strong on Chinese results, weak on English |
+| 3 | DuckDuckGo (html endpoint) | SOCKS5 proxy | Backup, needs a proxy |
 
-Bing is tried first (twice if the first attempt looks irrelevant). DuckDuckGo's html endpoint is reachable only through a proxy, so it needs v2rayN (or any SOCKS5 proxy) running.
-
-> **The backup is not gated on `use_proxy`.** If Bing's results look irrelevant, DuckDuckGo is tried regardless of which route you asked for — the fallback's job is "try another engine", and letting the primary engine's route choice veto it is how you end up returning junk with no second opinion. (If the proxy is down, the attempt just fails fast.)
+The next engine is only tried when the previous one produced no `good` result. DuckDuckGo is not gated on `use_proxy` — the fallback's job is "try another engine", and letting the primary engine's route choice veto it is how you end up with no second opinion at all.
 
 > **Why not Google?** The backup engine used to be Google. Modern Google no longer serves results to a plain HTTP client — it returns a JS shell page (title `Google Search`, zero result links), so the backup silently did nothing. DuckDuckGo's `html.duckduckgo.com/html/` endpoint still returns plain server-rendered results and is parseable.
 
-> **DuckDuckGo has rate limits.** Its html endpoint starts returning an `anomaly / challenge` page if you hit it too often, after which the fallback quietly finds nothing until the limit clears. Normal interactive use stays well under it; a test loop hammering it will trip it.
+> **Bing's RSS endpoint is not a workaround.** `&format=rss` returns the same ranking — measured: `"ED047TC2"` came back as 6G telecom news. The problem is the ranking, not the markup.
+
+### Rate limiting, cooldown, cache
+
+Plain HTTP scraping of search engines is fighting against anti-bot heuristics, so the server paces itself:
+
+| Setting | Default | Env var | Meaning |
+|---|---|---|---|
+| Min interval per engine | 2 s | `LOCAL_SEARCH_ENGINE_INTERVAL` | Spacing between requests to the same engine |
+| Cooldown after a block | 600 s | `LOCAL_SEARCH_ENGINE_COOLDOWN` | How long a blocked engine is benched |
+| Result cache TTL | 6 h | `LOCAL_SEARCH_CACHE_TTL` | Repeat queries come from memory |
+| Junk cache TTL | 120 s | `LOCAL_SEARCH_CACHE_NEG_TTL` | Short negative cache so junk queries don't re-hit engines |
+| Log file | `web-search.log` next to the script | `LOCAL_SEARCH_LOG` | One line per engine attempt; rotates at 2 MB. Set to empty to disable |
+
+A response is treated as a block if the status is `202`/`403`/`429`, or the body contains `anomaly`, `captcha`, `challenge`, `安全验证`, `验证码`, `antispider`, `too many requests` or `are you a robot`. Blocked engines are benched for the cooldown period and skipped instantly until then.
+
+Measured on this setup: DuckDuckGo `html` → `202` + anomaly; Baidu → `200` + `百度安全验证`; Mojeek → `403`; Yandex → captcha; Brave → `429`; Sogou → works, but blocks after ~2–3 rapid queries. That's why the pacing exists.
 
 Default proxy `socks5://127.0.0.1:1080`. Change the port via env var `LOCAL_SEARCH_SOCKS_PORT`:
 
@@ -159,25 +174,37 @@ The MCP client sends JSON-RPC 2.0 messages on stdin; the server replies on stdou
 ### Search flow
 
 ```python
-def web_search(query, num_results, use_proxy, fetch_content=True, fetch_top=3, content_chars=1500):
-    # 1) Bing — via proxy if use_proxy=True (overseas view), else direct (domestic).
-    #    Retry once if the results don't look like they answer the query.
-    for _ in range(2):
-        _collect(_bing(q, num, use_proxy), use_proxy)
-        if _have_usable():
-            break
-    # 2) DuckDuckGo html endpoint via proxy — tried whenever Bing looks wrong,
-    #    regardless of use_proxy (the fallback needs the proxy itself).
-    if not _have_usable():
-        _collect(_ddg(q, num), True)
-    # 3) Prefer a set that isn't junk; otherwise return the best-scoring one, flagged
-    usable = [a for a in attempts if not _is_junk(a[1], query)]
-    return _finish(max(usable or attempts, key=score)[1])
+def web_search(query, num_results, use_proxy, ...):
+    # Engines are tried in order; stop as soon as one gives a `good` result.
+    _try(bing_key, lambda: _bing_fetch(q, num, use_proxy), _parse_bing, use_proxy)
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+
+    _try("sogou", lambda: _sogou_fetch(q, num), _parse_sogou, False)
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+
+    _try("ddg", lambda: _ddg_fetch(q, num), _parse_ddg, True)
+
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+    if _best(LEVEL_PARTIAL):                       # subject matched, qualifiers didn't
+        out = _finish(_best(LEVEL_PARTIAL))
+        for r in out: r["warning"] = WARNING_PARTIAL
+        return out
+    raise SearchUnavailable(engine_status)         # never return junk
 ```
 
-### Deciding whether results are junk
+### Grading results: good / partial / junk
 
-Two rules, OR'd, because each covers the other's blind spot:
+Three levels, because a binary split can't be both safe and useful:
+
+| Level | Rule | What happens |
+|---|---|---|
+| `good` | Passes both junk rules below | Returned normally |
+| `partial` | Some query keyword appears somewhere in the set, but the set still fails a junk rule | Returned with `relevance: "partial"` and a `warning` |
+| `junk` | **No** query keyword appears anywhere in the set | Never returned — the call raises |
+
+`junk` is what soft-blocked engines actually serve: `"ED047TC2"` → BOSS直聘 job listings, `asdfqwer1234zzz` → Poki games. `partial` is what you get when only the subject matched: `RK3566 EBC_SDDO0 GPIO4 pin mux datasheet` → RK3566 datasheet pages. That's genuinely useful for long-tail research, but it doesn't answer the pin-mux question, so it's labelled rather than silently simplified into a different query.
+
+The two junk rules are OR'd, because each covers the other's blind spot:
 
 1. **Median keyword coverage below `RELEVANCE_FLOOR` (`0.20`)** — catches "one result happens to be on-topic, the other five are filler". Scoring the *best* result instead fails here: `solidworks.com` marketing pages score `0.33` on the best-result metric, *identical* to the genuinely-correct results for `python asyncio tutorial`, so no threshold can separate them. The median gives `0.17` vs `0.33`.
 2. **Most of the query's content words never appear anywhere in the result set** (query has ≥4 content words, ≥3 of them missing from every title/snippet) — catches "the engine matched one word and dropped all the qualifiers". This rule is computed over the *union* of all results, so unlike the median it doesn't change when `num_results` changes parity.
@@ -258,11 +285,12 @@ class _TextExtractor(HTMLParser):
 ## FAQ
 
 - **No search results?** Check your network. Domestic search needs Bing reachable; overseas search (`use_proxy=True`) needs v2rayN running.
+- **`web_search` returns an error instead of results?** That's intentional (v1.3.0+): every engine returned filler that had nothing to do with the query, and returning filler is worse than failing. The message lists each engine's state. Retry later, simplify the query, or `web_fetch` a known page directly. `web_fetch` is unaffected.
+- **All engines say "cooldown"?** They were detected as anti-bot pages (`202`/`403`/`429`, anomaly/captcha/安全验证 pages). Cooldown defaults to 10 minutes; tune with `LOCAL_SEARCH_ENGINE_COOLDOWN`. Lower `LOCAL_SEARCH_ENGINE_INTERVAL` to search faster at the risk of getting blocked sooner.
 - **`use_proxy=True` behaves exactly like `use_proxy=False`, byte for byte?** You're on v1.2.0 or earlier with no PySocks installed — the proxy was silently skipped. Fixed in v1.2.1 (stdlib SOCKS5).
 - **Search fails with `surrogates not allowed`?** That was the cp936/UTF-8 stdio bug, fixed in v1.2.0. If you see it, you're running an older file.
-- **Bing returns odd results for some queries?** Usually Bing, not the server — for certain queries it matches only one word and drops the rest. The server detects this, retries, and falls back to DuckDuckGo; if nothing relevant is available you'll see a `warning` field on the results.
-- **The DuckDuckGo fallback stopped finding anything?** Its html endpoint rate-limits with an `anomaly / challenge` page if you query it too often. Normal use is fine; automated loops trip it.
 - **Results are mojibake / full of `�`?** Also fixed in v1.2.0 — response bytes are now decoded by declared charset instead of assuming UTF-8.
+- **I need to debug what the engines did.** Check `web-search.log` next to the script (one line per attempt: engine, HTTP status, body size, parsed count, grade, relevance). Set `LOCAL_SEARCH_LOG` to relocate or empty it to disable.
 
 ## License
 

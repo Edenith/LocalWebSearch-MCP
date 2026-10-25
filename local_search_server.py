@@ -27,6 +27,7 @@ import re
 import socket
 import struct
 import sys
+import time
 import urllib.parse
 import urllib.request
 import zlib
@@ -44,7 +45,7 @@ UA = (
 )
 
 SERVER_NAME = "web-search"
-SERVER_VERSION = "1.2.1"
+SERVER_VERSION = "1.3.0"
 
 # 判断一个关键词里有没有中文字（用于决定是否套用"部分命中"放宽规则）
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -68,6 +69,35 @@ MAX_MISSED_TERMS = 3              # 未命中的实词达到这个数（且实�
 WARNING_JUNK = "结果与查询关键词重合度低，可能不相关（引擎对这条查询只匹配了其中个别词，返回了填充结果）"
 # 代理不可用时退回直连，必须说清楚——否则"走了代理却搜不到境外内容"很难查
 WARNING_NO_PROXY = "代理不可用，本次为直连结果（境外内容可能缺失）"
+WARNING_PARTIAL = "结果只命中了查询里的部分关键词，可能没有覆盖全部限定条件（例如只找到主词相关的页，没找到限定条件相关的页）"
+
+# 结果分级。调用方据此判断这批结果能不能当证据用。
+#   good    —— 关键词大部分命中，按正常结果用
+#   partial —— 只命中了一部分词（通常是主词），可用，但要知道它没覆盖全部限定条件
+#   junk    —— 一个关键词都没命中，是引擎塞的填充结果，绝不返回
+LEVEL_GOOD = "good"
+LEVEL_PARTIAL = "partial"
+LEVEL_JUNK = "junk"
+
+# --- 引擎节流 / 冷却 / 缓存 / 日志 ---
+# 为什么需要：无 Key 抓取搜索引擎，短时间连续请求会被判定为自动化流量。
+# 实测 Bing 被打降级后会返回"HTTP 200 + 随机内容"，搜狗打两三条就返回反爬页。
+# 这些参数都可以用环境变量覆盖。
+ENGINE_MIN_INTERVAL = float(os.environ.get("LOCAL_SEARCH_ENGINE_INTERVAL", "2.0"))
+ENGINE_COOLDOWN = float(os.environ.get("LOCAL_SEARCH_ENGINE_COOLDOWN", "600"))   # 被拦后冷却 10 分钟
+CACHE_TTL = float(os.environ.get("LOCAL_SEARCH_CACHE_TTL", "21600"))            # 正常结果缓存 6 小时
+CACHE_NEG_TTL = float(os.environ.get("LOCAL_SEARCH_CACHE_NEG_TTL", "120"))      # 全垃圾的查询负缓存 2 分钟
+CACHE_MAX = 256
+LOG_FILE = os.environ.get(
+    "LOCAL_SEARCH_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "web-search.log"),
+)
+# 反爬/拦截特征：命中即判定该引擎被拦，进入冷却，不再解析它的页面
+_BLOCK_STATUS = {202, 403, 429}
+_BLOCK_MARKERS = (
+    "anomaly", "captcha", "challenge", "security check",
+    "安全验证", "验证码", "antispider", "too many requests", "are you a robot",
+)
 
 # 做相关性判断时忽略的虚词：英文虚词 + 中文疑问/连接词。
 # 中文疑问词尤其重要——Bing 返回垃圾时经常只命中"如何""什么"这类词。
@@ -85,7 +115,7 @@ _STOPWORDS = {
 TOOLS = [
     {
         "name": "web_search",
-        "description": "用本机网络搜索网页。Bing 直连优先，结果与查询对不上时换 DuckDuckGo（该兜底不受 use_proxy 限制）。默认对前 fetch_top 个结果自动抓取正文片段放进 content 字段，供 AI 先粗略浏览再决定抓哪个详情。返回 [{'title','url','snippet','content','engine'}]；结果里可能带 warning 字段，表示「相关性低，可能是填充结果」或「代理不可用，本次为直连结果」。query=搜索词；num_results=返回条数(1-15)；use_proxy=True 走 v2rayN SOCKS5 代理；fetch_content=True 时自动抓正文；fetch_top=抓前几个(默认3)；content_chars=每个正文截取字符数(默认1500)。",
+        "description": "用本机网络搜索网页。依次尝试 Bing → 搜狗 → DuckDuckGo，并按结果与查询关键词的吻合度分三级：good（可信）、partial（只命中主词、限定条件没覆盖，结果带 relevance/ warning）、junk（与查询完全无关的填充内容，一律不返回——此时工具报错而不是给垃圾）。每条结果带 relevance 字段。默认对前 fetch_top 个结果自动抓取正文片段放进 content 字段。返回 [{'title','url','snippet','content','engine','relevance'}]。内置引擎级节流、反爬冷却与 6 小时缓存；引擎被限流时请稍后重试或改用 web_fetch 直接抓已知页面。query=搜索词；num_results=返回条数(1-15)；use_proxy=True 走 v2rayN SOCKS5 代理；fetch_content=True 时自动抓正文；fetch_top=抓前几个(默认3)；content_chars=每个正文截取字符数(默认1500)。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -311,14 +341,19 @@ def _build_opener(use_proxy):
     return urllib.request.build_opener()
 
 
-def _http_get(url, use_proxy, timeout):
-    """用 urllib 发起 GET。use_proxy=True 时通过 SOCKS5 代理。"""
+def _fetch(url, use_proxy, timeout):
+    """用 urllib 发起 GET，返回 (文本, HTTP 状态码)。
+
+    状态码要单独带出来：搜索引擎被反爬拦截时不一定是 4xx——
+    DuckDuckGo 是 202 + 拦截页，百度/搜狗是 200 + 验证页。
+    """
     req = urllib.request.Request(
         url,
         headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"},
     )
     opener = _build_opener(use_proxy)
     resp = opener.open(req, timeout=timeout)
+    status = resp.status
     raw = resp.read()
     # 透明解压：个别站点会无视我们没声明 Accept-Encoding 直接压 gzip/deflate
     enc = (resp.headers.get("Content-Encoding") or "").lower()
@@ -329,7 +364,155 @@ def _http_get(url, use_proxy, timeout):
             raw = zlib.decompress(raw, -zlib.MAX_WBITS)
     except (OSError, zlib.error):
         pass
-    return _decode_body(raw, resp.headers.get("Content-Type", ""))
+    return _decode_body(raw, resp.headers.get("Content-Type", "")), status
+
+
+def _http_get(url, use_proxy, timeout):
+    """只要正文的简化版，给 web_fetch / 抓正文用。"""
+    return _fetch(url, use_proxy, timeout)[0]
+
+
+# ----------------------------------------------------------------------------
+# 引擎状态：节流 / 冷却 / 反爬检测 / 缓存 / 日志
+#
+# 无 Key 抓搜索引擎的软肋就在这儿：短时间连续请求会被判成自动化流量。
+# 实测 Bing 被降级后不弹验证码，而是返回 HTTP 200 + 看似正常实为随机的填充结果；
+# 搜狗打两三条就返回 5KB 的反爬页。所以必须自己节流、识别拦截、并让被拦的引擎
+# 冷一段时间，而不是继续敲它。
+# ----------------------------------------------------------------------------
+class SearchUnavailable(RuntimeError):
+    """所有引擎都被拦、或只肯给出填充结果时抛出。
+
+    宁可明确报"没搜到"，也不把随机内容当搜索结果交出去 ——
+    调用方不读 warning 的话，那些内容会被当成证据用。
+    """
+
+
+_engine_state = {}   # name -> {"last": 上次请求时间, "blocked_until": 解封时间, "reason": 被拦原因}
+_search_cache = {}   # (engine, query, num) -> (过期时间, (结果, 等级))
+
+
+def _log(msg):
+    """记一条引擎尝试日志。写失败不影响搜索本身。"""
+    if not LOG_FILE:
+        return
+    try:
+        # 简单轮转：超过 2MB 就改名保留上一份，避免长期运行把磁盘写满
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 2 * 1024 * 1024:
+            try:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+            except OSError:
+                pass
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def _state_of(name):
+    return _engine_state.setdefault(
+        name, {"last": 0.0, "blocked_until": 0.0, "reason": ""}
+    )
+
+
+def _engine_wait(name):
+    """按引擎级最小间隔让路；引擎在冷却中则返回 (False, 原因)。"""
+    st = _state_of(name)
+    now = time.time()
+    if st["blocked_until"] > now:
+        return False, f"冷却中，还需 {int(st['blocked_until'] - now)}s（{st['reason']}）"
+    gap = st["last"] + ENGINE_MIN_INTERVAL - now
+    if gap > 0:
+        time.sleep(min(gap, ENGINE_MIN_INTERVAL))
+    return True, ""
+
+
+def _engine_done(name, blocked_reason=""):
+    """记录一次引擎调用；被拦则让它进入冷却。"""
+    st = _state_of(name)
+    st["last"] = time.time()
+    if blocked_reason:
+        st["blocked_until"] = time.time() + ENGINE_COOLDOWN
+        st["reason"] = blocked_reason
+
+
+def _blocked_reason(status, text):
+    """这次响应是不是反爬/拦截页？是则返回原因。"""
+    if status in _BLOCK_STATUS:
+        return f"HTTP {status}"
+    head = text[:20000].lower()
+    for marker in _BLOCK_MARKERS:
+        if marker in head:
+            return f"拦截页({marker})"
+    return ""
+
+
+def _cache_get(name, query, num):
+    key = (name, query, num)
+    item = _search_cache.get(key)
+    if not item:
+        return None
+    if item[0] < time.time():
+        _search_cache.pop(key, None)
+        return None
+    return item[1]
+
+
+def _cache_put(name, query, num, value, ttl):
+    if len(_search_cache) >= CACHE_MAX:
+        now = time.time()
+        for k in [k for k, v in _search_cache.items() if v[0] < now]:
+            _search_cache.pop(k, None)
+        if len(_search_cache) >= CACHE_MAX:
+            for k in list(_search_cache)[: CACHE_MAX // 2]:
+                _search_cache.pop(k, None)
+    _search_cache[(name, query, num)] = (time.time() + ttl, value)
+
+
+def _engine_status():
+    now = time.time()
+    parts = []
+    for name, st in _engine_state.items():
+        if st["blocked_until"] > now:
+            parts.append(f"{name} 冷却中 {int(st['blocked_until'] - now)}s({st['reason']})")
+        else:
+            parts.append(f"{name} 可用")
+    return "; ".join(parts) or "尚未调用任何引擎"
+
+
+def _run_engine(name, query, num, fetch_fn, parse_fn):
+    """跑一个引擎：缓存 → 节流 → 抓取 → 反爬检测 → 解析。
+
+    返回解析出的结果列表；该引擎被跳过/被拦/出错时返回 None。
+    结果定级与写缓存由调用方做（定级需要 query）。
+    """
+    cached = _cache_get(name, query, num)
+    if cached is not None:
+        _log(f"[{name}] 缓存命中 query={query!r} num={num} -> {len(cached[0])}条 {cached[1]}")
+        return cached[0]
+
+    ok, why = _engine_wait(name)
+    if not ok:
+        _log(f"[{name}] 跳过：{why}")
+        return None
+
+    try:
+        text, status = fetch_fn()
+    except Exception as e:
+        _engine_done(name)
+        _log(f"[{name}] 请求失败 {type(e).__name__}: {e}")
+        return None
+
+    blocked = _blocked_reason(status, text)
+    if blocked:
+        _engine_done(name, blocked)
+        _log(f"[{name}] 被拦 {blocked} (HTTP {status}, {len(text)}B)")
+        return None
+
+    _engine_done(name)
+    results = parse_fn(text, num)
+    _log(f"[{name}] HTTP {status} {len(text)}B -> {len(results)}条 query={query!r}")
+    return results
 
 
 # ----------------------------------------------------------------------------
@@ -412,6 +595,37 @@ def _parse_ddg(html, num):
     for i, r in enumerate(results):
         if i < len(snips):
             r["snippet"] = snips[i]
+    return results
+
+
+def _parse_sogou(html, num):
+    """解析搜狗网页搜索结果。
+
+    搜狗是少数在国内能直连、且对技术类查询仍给出"沾边"结果的引擎
+    （实测 RK3566 长尾查询能返回瑞芯微开发者社区的资料页），
+    在 Bing 被降级、DDG 被硬封的时候是唯一的备用。代价是它很容易触发反爬，
+    所以调用方必须配合节流与冷却。
+    """
+    results = []
+    noise = ("相关搜索", "其他人还搜", "相关游戏", "相关软件", "反馈")
+    for m in re.finditer(r"<h3[^>]*>(.*?)</h3>", html, re.S):
+        if len(results) >= num:
+            break
+        block = m.group(1)
+        am = re.search(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not am:
+            continue
+        title = _clean(re.sub(r"<[^>]+>", "", am.group(2)))
+        if not title or any(n in title for n in noise):
+            continue
+        url = unescape(am.group(1))
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = "https://www.sogou.com" + url
+        if not url.startswith("http"):
+            continue
+        results.append({"title": title, "url": url, "snippet": "", "engine": "sogou"})
     return results
 
 
@@ -528,75 +742,118 @@ def _is_junk(results, query):
     return total >= MIN_TERMS_FOR_COVERAGE_RULE and missed >= MAX_MISSED_TERMS
 
 
-def _bing(q, num, use_proxy):
-    html = _http_get(f"https://www.bing.com/search?q={q}&count={num}", use_proxy, 15)
-    return _parse_bing(html, num)
+def _level_of(results, query):
+    """把一批结果分成 good / partial / junk 三级。
+
+    junk 的判据是"整批结果里一个查询关键词都没出现"—— 这正是引擎被降级时
+    塞进来的填充结果的特征（查 ED047TC2 返回 BOSS直聘、查乱码返回小游戏）。
+    只要命中了主词、只是没覆盖限定条件，就算 partial：对长尾调研仍然有用，
+    但不能假装它把问题答全了。
+    """
+    if not results:
+        return LEVEL_JUNK
+    kws = _query_keywords(query)
+    if not kws:
+        return LEVEL_GOOD
+    hays = [f"{r.get('title', '')} {r.get('snippet', '')}".lower() for r in results]
+    if not any(any(_term_hit(k, h) for h in hays) for k in kws):
+        return LEVEL_JUNK
+    return LEVEL_PARTIAL if _is_junk(results, query) else LEVEL_GOOD
 
 
-def _ddg(q, num, timeout=8):
-    # 超时给得比主引擎短：这是"尽力而为"的兜底，代理不通时（端口在听但出口
-    # 挂了是最常见的坏法）不该让用户为了一个大概率要失败的第二引擎多等 20 秒。
-    html = _http_get(f"https://html.duckduckgo.com/html/?q={q}", True, timeout)
-    return _parse_ddg(html, num)
+def _bing_fetch(q, num, use_proxy):
+    return _fetch(f"https://www.bing.com/search?q={q}&count={num}", use_proxy, 15)
+
+
+def _sogou_fetch(q, num):
+    return _fetch(f"https://www.sogou.com/web?query={q}", False, 15)
+
+
+def _ddg_fetch(q, num):
+    # 超时给得短：这是"尽力而为"的兜底，代理不通时（端口在听但出口挂了是最常见
+    # 的坏法）不该让用户为了一个大概率要失败的第二引擎多等 20 秒。
+    return _fetch(f"https://html.duckduckgo.com/html/?q={q}", True, 8)
 
 
 def web_search(query, num_results, use_proxy, fetch_content=True, fetch_top=3, content_chars=1500):
     num = max(1, min(int(num_results), 15))
     q = urllib.parse.quote(query)
-    attempts = []  # [(中位数覆盖得分, 结果, 是否走了代理), ...]
+    attempts = []  # [(等级, 相关性得分, 结果, 是否走代理, 引擎名)]
 
-    def _collect(results, via_proxy):
-        if results:
-            attempts.append((_relevance(results, query), results, via_proxy))
+    def _collect(engine, results, via_proxy):
+        if not results:
+            return
+        level = _level_of(results, query)
+        score = _relevance(results, query)
+        attempts.append((level, score, results, via_proxy, engine))
+        # 全垃圾的结果只做短期负缓存，避免重复查询反复去打已经降级的引擎
+        ttl = CACHE_NEG_TTL if level == LEVEL_JUNK else CACHE_TTL
+        _cache_put(engine, query, num, (results, level), ttl)
+        _log(f"[{engine}] 定级={level} 相关性={score:.2f} {len(results)}条 query={query!r}")
 
-    def _have_usable():
-        """已经有任意一次尝试拿到了不像垃圾的结果。"""
-        return any(not _is_junk(a[1], query) for a in attempts)
+    def _best(level):
+        hits = [a for a in attempts if a[0] == level]
+        return max(hits, key=lambda a: a[1]) if hits else None
 
-    # 1) Bing。use_proxy 决定走直连（国内视角）还是代理（外网视角）。
-    #    Bing 对部分查询只认其中一个词、把其余限定词全丢掉，所以不合格就重试一次。
-    for _ in range(2):
-        try:
-            _collect(_bing(q, num, use_proxy), use_proxy)
-        except Exception:
-            pass
-        if _have_usable():
-            break
-
-    # 2) 只要 Bing 没给出合格结果，就再试 DuckDuckGo —— 不论 use_proxy 传的是什么。
-    #    兜底的意义是"换个引擎看看"，不该被主引擎的线路选择挡住；DDG 的 html
-    #    端点本身必须走代理，代理不通就当失败跳过（快速失败，不拖慢主流程）。
-    if not _have_usable():
-        try:
-            _collect(_ddg(q, num), True)
-        except Exception:
-            pass
-
-    if not attempts and use_proxy:
-        # 要代理却一次都没成功（代理没开、或端口在听但出口挂了）。
-        # 仍直连试一次，好过甩回一个毫无解释的空结果；同时打上警告说明。
-        try:
-            _collect(_bing(q, num, False), False)
-        except Exception:
-            pass
-        for r in (attempts[-1][1] if attempts else []):
-            r["warning"] = WARNING_NO_PROXY
-
-    if not attempts:
-        return []
-    # 先挑出"不像垃圾"的那一批；都是垃圾就退回得分最高的，并打上警告
-    usable = [a for a in attempts if not _is_junk(a[1], query)]
-    if usable:
-        best, via_proxy = max(usable, key=lambda a: a[0])[1:]
-        best = list(best)
-    else:
-        _, best, via_proxy = max(attempts, key=lambda a: a[0])
-        best = list(best)
+    def _finish(choice):
+        level, _, best, via_proxy, _ = choice
+        best = [dict(r) for r in best]  # 别把 warning/relevance 写回缓存里那份
         for r in best:
-            r["warning"] = WARNING_JUNK
-    if fetch_content:
-        return _attach_content(best, fetch_top, content_chars, via_proxy)
-    return best
+            r["relevance"] = level
+        if fetch_content:
+            return _attach_content(best, fetch_top, content_chars, via_proxy)
+        return best
+
+    def _try(name, fetch_fn, parse_fn, via_proxy):
+        results = _run_engine(name, query, num, fetch_fn, parse_fn)
+        _collect(name, results, via_proxy)
+
+    # 直连和代理是两条不同的网络路径，缓存/节流状态要分开记
+    bing_key = "bing-proxy" if use_proxy else "bing"
+
+    # 1) Bing —— 主引擎
+    _try(bing_key, lambda: _bing_fetch(q, num, use_proxy), _parse_bing, use_proxy)
+    if _best(LEVEL_GOOD):
+        return _finish(_best(LEVEL_GOOD))
+
+    # 2) 搜狗 —— 国内直连、不需要代理。Bing 被降级时它是主要的替补。
+    _try("sogou", lambda: _sogou_fetch(q, num), _parse_sogou, False)
+    if _best(LEVEL_GOOD):
+        return _finish(_best(LEVEL_GOOD))
+
+    # 3) DuckDuckGo（必须走代理）。兜底不受 use_proxy 限制 —— "换个引擎看看"
+    #    不该被主引擎的线路选择挡住。代理不通或被拦就快速跳过。
+    _try("ddg", lambda: _ddg_fetch(q, num), _parse_ddg, True)
+
+    good = _best(LEVEL_GOOD)
+    if good:
+        return _finish(good)
+
+    # 要了代理却一条都没跑通（代理没开/出口挂了）：直连 Bing 再试一次并说明
+    if not attempts and use_proxy:
+        _try("bing", lambda: _bing_fetch(q, num, False), _parse_bing, False)
+        if attempts:
+            out = _finish(attempts[0])
+            for r in out:
+                r.setdefault("warning", WARNING_NO_PROXY)
+            return out
+
+    partial = _best(LEVEL_PARTIAL)
+    if partial:
+        # 只命中了主词、没覆盖限定条件：可以给，但必须标明
+        out = _finish(partial)
+        for r in out:
+            r["warning"] = WARNING_PARTIAL
+        return out
+
+    # 全是 junk（或一个引擎都没跑通）：明确失败。
+    # 绝不把"看似正常、实际随机"的填充内容当搜索结果交出去 ——
+    # 调用方只要不读 warning，就会拿它当证据。
+    raise SearchUnavailable(
+        f"没有搜索引擎给出与 {query!r} 相关的结果，已放弃返回填充内容。"
+        f"引擎状态：{_engine_status()}。"
+        "可以稍后再试、简化查询，或者直接用 web_fetch 抓已知页面。"
+    )
 
 
 def web_fetch(url, timeout_s, use_proxy):

@@ -26,7 +26,8 @@ Claude Code ──MCP stdio──▶ local_search_server.py（本机 Python 进�
   - `web_fetch(url, timeout_s=20, use_proxy=True)` → 抓取网页正文
 - **自动抓正文**：搜索后并发抓取前 N 个结果页面，把正文片段附加到每条结果的 `content` 字段 —— AI 先粗略看内容，再决定抓哪个详情页
 - **双搜索模式**：`use_proxy=False` → Bing 直连（国内视角）；`use_proxy=True` → Bing 走 SOCKS5 代理（外网视角，附 DuckDuckGo 备用）—— 用于搜索境外内容、访问国内被墙的站点
-- **垃圾结果识别**：搜索引擎有时只拿查询里的**一个词**去做匹配，把其余限定词全丢掉 —— 比如 `SolidWorks Wine CrossOver Linux 2026 compatibility` 会返回 solidworks.com 官网营销页，`Hunt Showdown 1896 Easy Anti-Cheat Linux Proton support` 会返回"hunt"的词典释义。服务器会把结果集和查询关键词比对（中位数覆盖 + 有多少实词一个都没出现），不合格就重试一次 Bing，再不行换 DuckDuckGo；如果没有任何引擎给出相关结果，返回的结果会带上 `warning` 字段，而不是把垃圾当答案蒙混过去
+- **三级结果分级，并且失败关闭**：怀疑被自动化访问的搜索引擎不一定会弹验证码 —— 它们会返回 `HTTP 200` + 一个看起来正常、内容却**毫不相干**的页面。本机实测：`"ED047TC2"` 返回 BOSS直聘招聘页，`asdfqwer1234zzz` 返回 Poki 小游戏，长尾查询 `RK3566 EBC_SDDO0 GPIO4 pin mux datasheet` 只匹配了第一个词。每批结果会被分成 **good**（关键词大部分命中）、**partial**（命中主词但限定词没覆盖，返回但明确标注）、**junk**（查询里任何一个词都没出现在任何结果中）。**junk 一律不返回** —— 直接报错，因为不读 `warning` 的调用方会把填充内容当成证据
+- **三个引擎，带节流与冷却**：Bing → 搜狗 → DuckDuckGo。返回反爬页（`202`/`403`/`429`、`anomaly`、`captcha`、`安全验证`、`antispider` …）的引擎会被冷却 10 分钟，而不是继续敲；同引擎请求之间有最小间隔，结果缓存 6 小时
 - **真正的零依赖** —— 连代理也是。SOCKS5 是直接用标准库 socket 实现的（约 35 行），所以 `use_proxy` 不再取决于"恰好跑它的那个解释器里有没有装第三方包"
 - **Windows 下 UTF-8 正确**：MCP stdio 规定 UTF-8，但中文 Windows 上 Python 的 stdio 默认是 cp936/GBK —— 会让每个中文查询报废、每个中文结果变乱码。服务器直接读写 `sys.stdin.buffer` / `sys.stdout.buffer`，完全绕开 locale 编码
 - **按声明识别网页编码**：响应字节按 UTF-8 → HTTP/meta 声明的 `charset` → gb18030 依次尝试解码，GBK/GB2312 中文页不会再满屏 `�`；`gzip`/`deflate` 响应自动解压
@@ -107,7 +108,9 @@ mcp__web-search__web_fetch(url="https://...", use_proxy=true)
 | `fetch_top` | int | 3 | 抓取前几个结果的正文 |
 | `content_chars` | int | 1500 | 每条结果保留的正文最大字符数 |
 
-返回：`[{title, url, snippet, content, engine}]`
+返回：`[{title, url, snippet, content, engine, relevance}]`
+
+`engine` 为 `bing` / `sogou` / `duckduckgo`。`relevance` 为 `good` 或 `partial`；`partial` 的结果会额外带上 `warning`，说明查询的限定条件没被覆盖。当所有引擎返回的都是 junk 时，调用会**直接报错**（错误信息里带各引擎状态），而不是返回填充内容 —— 此时请稍后重试，或改用 `web_fetch` 直接抓已知页面。另外，要求走代理但代理不可用、只拿到直连结果时，也会带 `warning`。
 
 `engine` 为 `bing` 或 `duckduckgo`。结果上出现 `warning` 字段有两种情况：所有引擎的结果与查询关键词的重合度都过低（`结果与查询关键词重合度低…`），或者要求走代理但代理不可用、只拿到了直连结果（`代理不可用…`）。
 
@@ -123,17 +126,33 @@ mcp__web-search__web_fetch(url="https://...", use_proxy=true)
 
 ## 网络策略
 
-| 模式 | 引擎 | 方式 | 场景 |
+| 顺序 | 引擎 | 方式 | 场景 |
 |---|---|---|---|
-| `use_proxy=False` | Bing | 直连 | 国内搜索，无需代理 |
-| `use_proxy=True` | Bing | SOCKS5 代理 | 外网搜索 —— 境外内容、国内被墙的站点 |
-| `use_proxy=True` | DuckDuckGo（html 端点） | SOCKS5 代理 | 备用：Bing 结果与查询对不上时启用 |
+| 1 | Bing | 直连（`use_proxy=False`）或 SOCKS5（`use_proxy=True`） | 主引擎 |
+| 2 | 搜狗 | 直连 | 国内可达的备用，不需要代理。中文强、英文弱 |
+| 3 | DuckDuckGo（html 端点） | SOCKS5 代理 | 备用，需要代理 |
 
-先试 Bing（若第一次结果不相关会再重试一次）。DuckDuckGo 的 html 端点只能走代理，需要 v2rayN（或任意 SOCKS5 代理）在跑。
-
-> **兜底不受 `use_proxy` 限制。** 只要 Bing 的结果看起来不相关，就会去试 DuckDuckGo，不管你这次要求走哪条线路 —— 兜底的本职是"换个引擎看看"，让主引擎的线路选择去否决它，结果就是"没有第二意见、直接把垃圾返回"。代理不通时它只是快速失败而已。
+只有前一个引擎没给出 `good` 结果时，才会试下一个。DuckDuckGo 不受 `use_proxy` 限制 —— 兜底的本职是"换个引擎看看"，让主引擎的线路选择去否决它，结果就是"压根没有第二意见"。
 
 > **为什么不用 Google 了？** 备用引擎原本是 Google。但现在的 Google 不再给无 JS 的 HTTP 客户端返回结果，只回一个空壳页（页面标题是 `Google Search`，正文里 0 个结果链接），兜底等于没做。DuckDuckGo 的 `html.duckduckgo.com/html/` 端点仍然返回服务端渲染好的纯 HTML 结果，可以正则直接解析。
+
+> **Bing 的 RSS 端点不是解药。** `&format=rss` 拿到的是同一套排序 —— 实测 `"ED047TC2"` 在 RSS 里返回的是 6G 通信新闻。问题出在排序，不在 HTML 结构。
+
+### 限流、冷却与缓存
+
+无 Key 抓搜索引擎，本质上是在跟反爬启发式对抗，所以服务器会自己控速：
+
+| 参数 | 默认值 | 环境变量 | 含义 |
+|---|---|---|---|
+| 同引擎最小间隔 | 2 秒 | `LOCAL_SEARCH_ENGINE_INTERVAL` | 两次请求同一引擎之间的间隔 |
+| 被拦后冷却 | 600 秒 | `LOCAL_SEARCH_ENGINE_COOLDOWN` | 被判定反爬后停用多久 |
+| 结果缓存 | 6 小时 | `LOCAL_SEARCH_CACHE_TTL` | 重复查询直接走内存 |
+| 垃圾结果负缓存 | 120 秒 | `LOCAL_SEARCH_CACHE_NEG_TTL` | 短时缓存，避免反复去打已降级的引擎 |
+| 日志文件 | 脚本同目录的 `web-search.log` | `LOCAL_SEARCH_LOG` | 每次引擎尝试一行；超过 2MB 轮转。设为空串可关闭 |
+
+判定为反爬的条件：状态码 `202`/`403`/`429`，或正文里出现 `anomaly`、`captcha`、`challenge`、`安全验证`、`验证码`、`antispider`、`too many requests`、`are you a robot`。被拦的引擎会进入冷却，期间直接跳过。
+
+本机实测：DuckDuckGo `html` → `202` + anomaly；百度 → `200` + `百度安全验证`；Mojeek → `403`；Yandex → 验证码；Brave → `429`；搜狗 → 可用，但连续两三条就触发反爬。节流的存在就是为了这个。
 
 > **DuckDuckGo 有限流。** 请求太频繁时它的 html 端点会开始返回 `anomaly / challenge` 拦截页，之后兜底就会一直什么都找不到，直到限流解除。正常交互式使用远达不到这个量；但拿测试脚本反复打会被拦。
 
@@ -161,25 +180,37 @@ MCP（Model Context Protocol）客户端通过 stdin 发 JSON-RPC 2.0 消息，�
 ### 搜索流程
 
 ```python
-def web_search(query, num_results, use_proxy, fetch_content=True, fetch_top=3, content_chars=1500):
-    # 1) Bing —— use_proxy=True 走代理（外网视角），False 直连（国内视角）。
-    #    结果看起来不像在回答这条查询，就重试一次。
-    for _ in range(2):
-        _collect(_bing(q, num, use_proxy), use_proxy)
-        if _have_usable():
-            break
-    # 2) DuckDuckGo 的 html 端点走代理 —— 只要 Bing 看着不对就试，
-    #    不论 use_proxy 传的是什么（兜底自己需要代理）。
-    if not _have_usable():
-        _collect(_ddg(q, num), True)
-    # 3) 优先取"不像垃圾"的那一批；全是垃圾就返回得分最高的，并打上警告
-    usable = [a for a in attempts if not _is_junk(a[1], query)]
-    return _finish(max(usable or attempts, key=score)[1])
+def web_search(query, num_results, use_proxy, ...):
+    # 按顺序试引擎；一旦某个给出 good 结果就停止
+    _try(bing_key, lambda: _bing_fetch(q, num, use_proxy), _parse_bing, use_proxy)
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+
+    _try("sogou", lambda: _sogou_fetch(q, num), _parse_sogou, False)
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+
+    _try("ddg", lambda: _ddg_fetch(q, num), _parse_ddg, True)
+
+    if _best(LEVEL_GOOD): return _finish(_best(LEVEL_GOOD))
+    if _best(LEVEL_PARTIAL):                       # 命中主词、限定词没覆盖
+        out = _finish(_best(LEVEL_PARTIAL))
+        for r in out: r["warning"] = WARNING_PARTIAL
+        return out
+    raise SearchUnavailable(engine_status)         # 绝不返回垃圾
 ```
 
-### 怎么判断结果是不是垃圾
+### 结果分级：good / partial / junk
 
-两条判据取或，因为各自都有对方覆盖不到的盲区：
+分三级，因为"非黑即白"没法同时做到安全和有用：
+
+| 等级 | 判据 | 处理 |
+|---|---|---|
+| `good` | 通过下面两条垃圾判据 | 正常返回 |
+| `partial` | 查询里有关键词出现在某条结果里，但仍未通过垃圾判据 | 返回，带 `relevance: "partial"` 和 `warning` |
+| `junk` | **查询里任何一个关键词都没出现在任何结果中** | 绝不返回 —— 直接报错 |
+
+`junk` 正是被软封的引擎喂给我们的东西：`"ED047TC2"` → BOSS直聘招聘页，`asdfqwer1234zzz` → Poki 小游戏。`partial` 则是"只命中了主词"：`RK3566 EBC_SDDO0 GPIO4 pin mux datasheet` → 一批 RK3566 数据手册页。这对长尾调研确实有用，但它没有回答 pin mux 那个问题，**所以明确标注，而不是偷偷把查询简化成另一个问题**。
+
+两条垃圾判据取或，因为各自都有对方覆盖不到的盲区：
 
 1. **中位数关键词覆盖低于 `RELEVANCE_FLOOR`（`0.20`）** —— 抓"一条碰巧沾边、其余五条全是填充"的情况。这里如果按"最好那一条"打分就会失效：solidworks.com 的营销页在"最好一条"口径下得 `0.33`，和结果完全正确的 `python asyncio tutorial` **数值一模一样**，任何阈值都分不开；换成中位数后两者是 `0.17` 和 `0.33`。
 2. **查询的实词绝大多数在整批结果里一次都没出现**（实词 ≥4 个，其中 ≥3 个任何标题/摘要里都没有）—— 抓"引擎只认了一个词、把其余限定词全丢掉"的情况。这条按**整批结果的并集**算，所以不像中位数那样会随 `num_results` 的奇偶变化。
@@ -260,11 +291,12 @@ class _TextExtractor(HTMLParser):
 ## 常见问题
 
 - **搜索没结果？** 先确认网络：国内搜索需能连 Bing；外网搜索（`use_proxy=True`）需开 v2rayN
+- **`web_search` 报错而不是返回结果？** 这是 v1.3.0+ 的有意行为：所有引擎返回的都是与查询无关的填充内容，**返回填充内容比失败更糟**。错误信息里列出了每个引擎的状态。稍后重试、简化查询，或用 `web_fetch` 直接抓已知页面 —— `web_fetch` 不受影响
+- **引擎全都显示"冷却中"？** 它们被识别为反爬页（`202`/`403`/`429`，或 anomaly/captcha/安全验证 等页面）。冷却默认 10 分钟，可用 `LOCAL_SEARCH_ENGINE_COOLDOWN` 调；想搜得更快可以调小 `LOCAL_SEARCH_ENGINE_INTERVAL`，代价是更容易被拦
 - **`use_proxy=True` 和 `use_proxy=False` 的结果一模一样、字节级相同？** 那是 v1.2.0 及更早版本 + 没装 PySocks 的表现 —— 代理被静默跳过了。v1.2.1 已改为纯标准库 SOCKS5
 - **报 `surrogates not allowed`？** 那是 cp936/UTF-8 stdio 的 bug，v1.2.0 已修。还会看到它就说明你在用旧文件
-- **某些查询结果怪异？** 通常是 Bing 自己的问题 —— 它只匹配了查询里的一个词，把其余限定词丢了。服务器现在会识别、重试并切换到 DuckDuckGo；实在没有相关的，结果里会带 `warning` 字段
-- **DuckDuckGo 兜底突然什么都找不到了？** 它的 html 端点有限流，请求太频繁会返回 `anomaly / challenge` 拦截页。正常使用没问题，脚本反复打会被拦
 - **结果全是乱码 / `�`？** 同样是 v1.2.0 修掉的 —— 响应字节现在按声明的 charset 解码，不再一律当 UTF-8
+- **想查引擎到底做了什么？** 看脚本同目录的 `web-search.log`（每次尝试一行：引擎、HTTP 状态、正文大小、解析条数、等级、相关性）。用 `LOCAL_SEARCH_LOG` 改位置，设为空串可关闭
 
 ## 许可
 
